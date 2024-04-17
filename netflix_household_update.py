@@ -124,14 +124,17 @@ class NetflixLocationUpdate:
 
     def fetch_mails(self):
         # Select the mailbox you want to fetch emails from
-        self._mail.select(self._mailbox_name)
+        result, _ = self._mail.select(self._mailbox_name)
+        if result != "OK":
+            logging.error(f"Failed to select mailbox, result came back {result}, skipping...")
+            pass
 
         # Search for unread emails from the specified sender
         search_criteria = f'(UNSEEN FROM "Netflix")'
         result, data = self._mail.search(None, search_criteria)
 
         if result != "OK":
-            logging.error("Failed to fetch emails, skipping...")
+            logging.error(f"Failed to search mailbox, result came back {result}, skipping...")
             pass
 
         # Get the list of email IDs
@@ -207,6 +210,8 @@ class NetflixScheduler:
             try:
                 self._location_update.fetch_mails()
                 time.sleep(self._polling_time)
+            except imaplib.IMAP4.abort:
+                self._location_update.__init__()
             except KeyboardInterrupt:
                 logging.info("Break script by keyboard interrupt")
                 break
