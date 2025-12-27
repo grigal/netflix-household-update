@@ -123,26 +123,38 @@ class NetflixLocationUpdate:
         return False
 
     def fetch_mails(self):
-        # Select the mailbox you want to fetch emails from
-        result, _ = self._mail.select(self._mailbox_name)
-        if result != "OK":
-            logging.error(f"Failed to select mailbox, result came back {result}, skipping...")
-            pass
+        
+        try:
+            # Select the mailbox you want to fetch emails from
+            logging.info("Will fetch emails...")
+            self._mail.select(self._mailbox_name)
 
-        # Search for unread emails from the specified sender
-        search_criteria = f'(UNSEEN FROM "Netflix")'
-        result, data = self._mail.search(None, search_criteria)
+            # Search for unread emails from the specified sender
+            search_criteria = f'(UNSEEN FROM "Netflix")'
+            result, data = self._mail.search(None, search_criteria)
 
-        if result != "OK":
-            logging.error(f"Failed to search mailbox, result came back {result}, skipping...")
-            pass
+            if result != "OK":
+                logging.error("Failed to fetch emails, skipping...")
+                pass
 
-        # Get the list of email IDs
-        email_ids = data[0].split()
+            # Get the list of email IDs
+            email_ids = data[0].split()
 
+        except imaplib.IMAP4.abort:
+            #TODO: Refactor
+            logging.warning("Session expired, trying to login again")
+            imap_server =  os.environ.get('IMAP_SERVER', '')
+            imap_port =  os.environ.get('IMAP_PORT', 993)
+            imap_username = os.environ.get('IMAP_USER', '')
+            imap_password =  os.environ.get('IMAP_PASS', '')
+            self._mail = self.__init_mails(imap_server, imap_port, imap_username, imap_password)
+            return
+
+        if not email_ids:
+            logging.info("No relevant emails found...")
         # List to store extracted href attributes
         href_list = []
-
+        
         # Iterate over the email IDs in reverse order (newest to oldest)
         for email_id in reversed(email_ids):
             logging.info(f"Found Netflix Email, ID: {email_id}")
@@ -218,6 +230,7 @@ class NetflixScheduler:
             except Exception as e:
                 logging.critical(e, exc_info=True)
         
+        logging.warn("Closing location updater!")
         self._location_update.close()
 
 
@@ -225,5 +238,5 @@ if __name__ == '__main__':
     polling_time = os.environ.get('POLLING_TIME_IN_SECONDS', 2)
     
     netflix_updater = NetflixLocationUpdate()
-    scheduler = NetflixScheduler(polling_time=polling_time, location_update=netflix_updater)
+    scheduler = NetflixScheduler(polling_time=int(polling_time), location_update=netflix_updater)
     scheduler.run()
