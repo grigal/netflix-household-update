@@ -5,18 +5,15 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Run Netflix Updater",
+            "name": "Python: Run Netflix Updater",
             "type": "debugpy",
             "request": "launch",
-            "program": "netflix_household_update.py",
+            "module": "src.main",
             "console": "integratedTerminal",
-            "env": {
-                "IMAP_SERVER": "",
-                "IMAP_USER": "",
-                "IMAP_PASS": "",
-                "NETFLIX_USER": "",
-                "NETFLIX_PASS": "",
-              }
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
         }
     ]
 }
