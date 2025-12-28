@@ -146,28 +146,31 @@ class EmailMonitor:
             finally:
                 self.command_client = None
 
-    async def move_email_to_folder(self, email_id: str) -> None:
+    async def move_email_to_folder(self, email_uid: str) -> None:
         """Mark email as read, move to processed folder, and mark as deleted.
 
         Args:
-            email_id: Email ID to move
+            email_uid: Email UID to move
         """
         if not self.command_client:
             raise RuntimeError("IMAP command client not connected")
 
         try:
-            await self.command_client.store(email_id, "+FLAGS", r"(\Seen)")
+            # Use UID STORE to mark as read (permanent identifier)
+            await self.command_client.uid("store", email_uid, "+FLAGS", r"(\Seen)")
 
             if self.settings.move_emails_to_mailbox:
-                await self.command_client.copy(email_id, self.settings.move_to_mailbox_name)
-                await self.command_client.store(email_id, "+FLAGS", r"(\Deleted)")
+                # Use UID COPY to copy to processed folder
+                await self.command_client.uid("copy", email_uid, self.settings.move_to_mailbox_name)
+                # Use UID STORE to mark as deleted
+                await self.command_client.uid("store", email_uid, "+FLAGS", r"(\Deleted)")
 
-            logger.debug("email_processed_and_moved", email_id=email_id)
+            logger.debug("email_processed_and_moved", uid=email_uid)
 
         except Exception as e:
             logger.error(
                 "email_move_failed",
-                email_id=email_id,
+                uid=email_uid,
                 error=str(e),
                 exc_info=True,
             )
@@ -184,17 +187,51 @@ class EmailMonitor:
             except Exception as e:
                 logger.warning("expunge_failed", error=str(e))
 
-    async def wait_for_new_emails_idle(self, timeout: int = 1740) -> Optional[str]:
-        """Wait for new emails using IMAP IDLE (push notifications).
-
-        Args:
-            timeout: IDLE timeout in seconds (default 29 minutes, RFC recommends < 30min)
+    def _build_sender_search_query(self) -> str:
+        """Build IMAP search query with FROM criteria for authorized senders.
 
         Returns:
-            Email ID if new email arrived, None if timeout or error
+            IMAP search query string (e.g., 'UNSEEN FROM "sender@example.com"')
         """
+        senders = self.settings.sender_emails
+
+        # Single sender case
+        if len(senders) == 1:
+            return f'UNSEEN FROM "{senders[0]}"'
+
+        # Multiple senders - use IMAP OR syntax
+        # Two senders: UNSEEN OR FROM "a" FROM "b"
+        if len(senders) == 2:
+            return f'UNSEEN OR FROM "{senders[0]}" FROM "{senders[1]}"'
+
+        # Three or more senders: UNSEEN OR (OR FROM "a" FROM "b") FROM "c"
+        # Build nested OR structure
+        query = f'OR FROM "{senders[0]}" FROM "{senders[1]}"'
+        for sender in senders[2:]:
+            query = f'OR ({query}) FROM "{sender}"'
+
+        return f'UNSEEN {query}'
+
+    async def wait_for_new_emails_idle(self, timeout: Optional[int] = None) -> Optional[list[str]]:
+        """Wait for new emails using IMAP IDLE (push notifications).
+
+        Uses server-side filtering (UID SEARCH UNSEEN FROM) to only return emails
+        from authorized senders, dramatically reducing overhead when many unseen
+        emails exist from other senders.
+
+        Args:
+            timeout: IDLE timeout in seconds (uses settings.idle_timeout_seconds if None)
+
+        Returns:
+            List of email UIDs from authorized senders if new emails arrived, None if timeout or error
+        """
+        if timeout is None:
+            timeout = self.settings.idle_timeout_seconds
         if not self.idle_client:
             raise RuntimeError("IMAP idle client not connected")
+
+        if not self.command_client:
+            raise RuntimeError("IMAP command client not connected")
 
         try:
             if not hasattr(self.idle_client, "idle_start"):
@@ -204,107 +241,132 @@ class EmailMonitor:
             logger.debug("entering_idle_mode", timeout=timeout)
 
             await self.idle_client.idle_start(timeout=timeout)
-
             result = await self.idle_client.wait_server_push(timeout=timeout)
-
             self.idle_client.idle_done()
 
-            logger.info("idle_received_response", result=str(result))
+            # Handle both Response namedtuple and raw list (aioimaplib inconsistency)
+            lines = result.lines if hasattr(result, 'lines') else result
 
-            # Check if we got new mail notification
-            # result can be a list of bytes or a Response object
-            lines_to_check = []
-            if isinstance(result, list):
-                lines_to_check = result
-            elif hasattr(result, 'lines'):
-                lines_to_check = result.lines
+            # Early return if no server push lines
+            if not lines:
+                logger.info("idle_timeout_no_new_emails")
+                return None
 
-            if lines_to_check:
-                logger.info("idle_response_lines", lines=[str(line) for line in lines_to_check])
-                for line in lines_to_check:
-                    if b"EXISTS" in line:
-                        # Extract email ID from "28382 EXISTS"
-                        try:
-                            email_id = line.split()[0].decode()
-                            logger.info("new_email_notification_received", email_id=email_id)
-                            return email_id
-                        except (ValueError, IndexError) as e:
-                            logger.warning("failed_to_parse_email_id", line=str(line), error=str(e))
-                            return None
+            # During IDLE, server can send: EXISTS (new mail), EXPUNGE (deleted), FETCH (flags changed)
+            # We only care about EXISTS - new mail arrived
+            for line in lines:
+                if b"EXISTS" in line:
+                    logger.info("idle_received_exists", line=str(line))
+                    return await self._fetch_uids_from_exists(line)
 
-            logger.info("idle_timeout_no_new_emails")
+            # No EXISTS notification - EXPUNGE or FETCH only
+            logger.debug("idle_notification_not_exists",
+                        lines=[str(line) for line in lines])
             return None
 
         except asyncio.TimeoutError:
-            # Normal timeout - no emails arrived during IDLE period
             logger.debug("idle_timeout_expired")
             return None
         except Exception as e:
-            # Actual errors (connection issues, protocol errors, etc.)
             logger.warning("idle_mode_failed",
                           error=str(e),
                           error_type=type(e).__name__,
                           exc_info=True)
             return None
 
-    async def fetch_email_by_id(self, email_id: str) -> Optional[tuple[str, bytes]]:
-        """Fetch a specific email by ID.
+    async def _fetch_uids_from_exists(self, exists_line: bytes) -> Optional[list[str]]:
+        """Fetch UIDs after receiving EXISTS notification.
 
         Args:
-            email_id: IMAP email sequence number
+            exists_line: IMAP EXISTS response line (e.g., b'28396 EXISTS')
 
         Returns:
-            Tuple of (email_id, raw_email_data) or None if not found
+            List of email UIDs from authorized senders, or None if none found
+        """
+        try:
+            exists_count = exists_line.split()[0].decode()
+            logger.debug("exists_notification", exists_count=exists_count)
+
+            # Time the UID resolution overhead
+            import time
+            uid_start = time.time()
+
+            # Build server-side IMAP search with FROM filter
+            # This dramatically reduces overhead when many unseen emails exist
+            search_query = self._build_sender_search_query()
+            logger.debug("executing_uid_search", query=search_query)
+            search_result = await self.command_client.uid_search(search_query)
+            logger.debug("uid_search_result", result=search_result.result,
+                        lines=[line.decode() if isinstance(line, bytes) else str(line) for line in search_result.lines] if search_result.lines else [])
+
+            uid_overhead = time.time() - uid_start
+
+            # Early return if search failed
+            if search_result.result != "OK" or len(search_result.lines) < 1:
+                logger.debug("no_unseen_emails_found")
+                return None
+
+            # Parse UIDs from search result
+            # Gmail returns: ['65490', 'SEARCH completed (Success)']
+            # Other servers may return: [b'SEARCH 65490 65491']
+            search_line = search_result.lines[0]
+
+            # Handle both bytes and string responses
+            if isinstance(search_line, bytes):
+                search_line_str = search_line.decode()
+            else:
+                search_line_str = str(search_line)
+
+            # Extract UIDs - handle both formats
+            if search_line_str.startswith('SEARCH'):
+                # Format: "SEARCH 65490 65491"
+                parts = search_line_str.split()
+                uids = [uid for uid in parts[1:] if uid.isdigit()]
+            else:
+                # Format: "65490" or "65490 65491" (Gmail style - UIDs without SEARCH keyword)
+                parts = search_line_str.split()
+                uids = [uid for uid in parts if uid.isdigit()]
+
+            if not uids:
+                logger.debug("no_unseen_emails_found")
+                return None
+
+            logger.info("new_emails_detected",
+                       uid_count=len(uids),
+                       uid_resolution_ms=round(uid_overhead * 1000, 1))
+            return uids
+
+        except (ValueError, IndexError) as e:
+            logger.warning("failed_to_resolve_uids", error=str(e))
+            return None
+
+    async def fetch_email_by_id(self, email_uid: str) -> Optional[tuple[str, bytes]]:
+        """Fetch a specific email by UID.
+
+        Args:
+            email_uid: IMAP email UID (permanent identifier)
+
+        Returns:
+            Tuple of (email_uid, raw_email_data) or None if not found
         """
         if not self.command_client:
             raise RuntimeError("IMAP command client not connected")
 
         try:
-            # Log the command client state
-            logger.debug("command_client_state",
-                       email_id=email_id,
-                       has_protocol=hasattr(self.command_client, 'protocol'),
-                       protocol_state=self.command_client.protocol.state if hasattr(self.command_client, 'protocol') else 'unknown')
+            logger.debug("fetching_email_by_uid", uid=email_uid)
 
-            # CRITICAL FIX: EXISTS number (e.g., 28399) is NOT the actual sequence number!
-            # EXISTS is a cumulative count including all deleted messages ever
-            # The actual current messages have sequence numbers 1-N where N is much smaller
-            # We need to fetch the LAST message using "*" which points to the highest sequence number
-
-            logger.debug("exists_id_received", exists_number=email_id)
-
-            # Use "*" to fetch the last (newest) message in the mailbox
-            actual_email_id = "*"
-            logger.info("corrected_email_id",
-                       exists_number=email_id,
-                       actual_sequence=actual_email_id,
-                       reason="EXISTS_is_not_sequence_number")
-
-            # Use BODY.PEEK[] to fetch without marking as read
-            # Will only mark as read later if it's from Netflix
-            # Note: Must use parentheses like (BODY.PEEK[]) for proper IMAP syntax
-            logger.debug("attempting_body_peek_fetch", actual_email_id=actual_email_id)
-            result = await self.command_client.fetch(actual_email_id, "(BODY.PEEK[])")
-
-            # Detailed debug logging
-            logger.debug("fetch_response_full_debug",
-                       email_id=email_id,
-                       result_status=result.result,
-                       result_lines_count=len(result.lines),
-                       all_lines=[str(line[:200]) for line in result.lines],
-                       result_type=str(type(result)),
-                       result_dir=[attr for attr in dir(result) if not attr.startswith('_')])
+            # Use UID FETCH to fetch by permanent UID instead of sequence number
+            # This is race-condition free and works even if messages are deleted
+            result = await self.command_client.uid("fetch", email_uid, "(BODY.PEEK[])")
 
             if result.result != "OK":
-                logger.warning("email_fetch_failed", email_id=email_id, result=str(result))
+                logger.warning("uid_fetch_failed", uid=email_uid, result=str(result))
                 return None
 
-            # aioimaplib FETCH response structure:
-            # result.lines[0]: b'ID FETCH (BODY[] {size}' or similar
+            # aioimaplib UID FETCH response structure:
+            # result.lines[0]: b'SEQ FETCH (UID 28399 BODY[] {size}' or similar
             # result.lines[1]: bytearray or bytes with actual email data
-            # But sometimes the response format is different - let's handle both
 
-            # Check if we have data
             if len(result.lines) >= 2:
                 raw_email = result.lines[1]
 
@@ -312,13 +374,13 @@ class EmailMonitor:
                 if isinstance(raw_email, bytearray):
                     raw_email = bytes(raw_email)
 
-                return (email_id, raw_email)
+                return (email_uid, raw_email)
 
-            logger.warning("unexpected_fetch_response", email_id=email_id)
+            logger.warning("unexpected_uid_fetch_response", uid=email_uid)
             return None
 
         except Exception as e:
-            logger.error("fetch_email_by_id_failed", email_id=email_id, error=str(e), exc_info=True)
+            logger.error("fetch_email_by_uid_failed", uid=email_uid, error=str(e), exc_info=True)
             return None
 
     async def process_email_by_id(self, email_id: str) -> Optional[str]:
@@ -360,10 +422,10 @@ class EmailMonitor:
 
         This method stays in IDLE mode as much as possible, only briefly
         exiting when a new email arrives. It does NOT process emails,
-        just detects that they arrived and yields the email ID.
+        just detects that they arrived and yields email UIDs.
 
         Yields:
-            Email ID when new emails are detected
+            Email UID when new emails are detected
         """
         self._running = True
         logger.info("starting_idle_notification_monitoring")
@@ -371,11 +433,12 @@ class EmailMonitor:
         while self._running:
             try:
                 # Wait for new emails (IDLE active here - fast detection)
-                email_id = await self.wait_for_new_emails_idle()
+                email_uids = await self.wait_for_new_emails_idle()
 
-                if email_id:
-                    # Yield the email ID for processing
-                    yield email_id
+                if email_uids:
+                    # Yield each UID for processing
+                    for uid in email_uids:
+                        yield uid
 
             except Exception as e:
                 logger.error("idle_monitoring_error", error=str(e), exc_info=True)

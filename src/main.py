@@ -39,17 +39,14 @@ class NetflixHouseholdUpdater:
         self.browser_pool = browser_pool or BrowserPool(settings, pool_size=1)
         self._shutdown_event = asyncio.Event()
         # Two-queue architecture for maximum parallelism
-        self._email_queue: asyncio.Queue[int] = asyncio.Queue()  # Email IDs to process
-        self._link_queue: asyncio.Queue[str] = asyncio.Queue()   # Verification links to process
+        self._email_queue: asyncio.Queue[int] = asyncio.Queue()
+        self._link_queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def initialize(self) -> None:
         """Initialize all components."""
         logger.info("initializing_application")
 
-        # Initialize browser pool
         await self.browser_pool.initialize()
-
-        # Connect to email server
         await self.email_monitor.connect()
 
         logger.info("application_initialized")
@@ -58,42 +55,11 @@ class NetflixHouseholdUpdater:
         """Clean up all resources."""
         logger.info("cleaning_up_application")
 
-        # Stop email monitor
         self.email_monitor.stop()
-
-        # Disconnect from email
         await self.email_monitor.disconnect()
-
-        # Clean up browsers
         await self.browser_pool.cleanup()
 
         logger.info("application_cleaned_up")
-
-    async def process_verification_links(self, links: list[str]) -> None:
-        """Process verification links concurrently.
-
-        Args:
-            links: List of verification URLs
-        """
-        if not links:
-            return
-
-        logger.info("processing_verification_links", count=len(links))
-
-        # Process links concurrently
-        tasks = [self.browser_pool.process_link(link) for link in links]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Log results
-        success_count = sum(1 for r in results if r is True)
-        failure_count = len(results) - success_count
-
-        logger.info(
-            "verification_links_processed",
-            total=len(links),
-            success=success_count,
-            failed=failure_count,
-        )
 
     async def _email_monitoring_loop(self) -> None:
         """Continuously monitor for new email notifications.
@@ -117,8 +83,11 @@ class NetflixHouseholdUpdater:
                 metrics.idle_detections += 1
 
                 # Queue the email ID for processing (non-blocking)
-                logger.debug("new_email_detected_queuing_for_processing",
-                           email_id=email_id, idle_pause_seconds=round(idle_pause, 3))
+                notification_timestamp = time.time()
+                logger.info("email_notification_received",
+                           email_id=email_id,
+                           notification_timestamp=notification_timestamp,
+                           idle_pause_seconds=round(idle_pause, 3))
                 await self._email_queue.put(email_id)
 
                 # Track queue depth
@@ -164,10 +133,10 @@ class NetflixHouseholdUpdater:
                     if link:
                         # Queue the verification link
                         await self._link_queue.put(link)
-                        logger.info("email_processing_completed",
+                        logger.info("link_extracted_from_email",
                                    email_id=email_id,
-                                   duration_seconds=round(duration, 2),
-                                   link_found=True)
+                                   link=link,
+                                   email_processing_seconds=round(duration, 2))
 
                         # Track link queue depth
                         metrics.record_queue_depth("link", self._link_queue.qsize())
@@ -218,10 +187,12 @@ class NetflixHouseholdUpdater:
 
                     # Track timing and result
                     duration = time.time() - start_time
+                    verification_timestamp = time.time()
                     metrics.record_verification(duration, success)
-                    logger.info("link_verification_completed",
+                    logger.info("end_to_end_verification_completed",
                                link=link,
-                               duration_seconds=round(duration, 2),
+                               verification_timestamp=verification_timestamp,
+                               verification_seconds=round(duration, 2),
                                success=success)
 
                     self._link_queue.task_done()
@@ -257,7 +228,6 @@ class NetflixHouseholdUpdater:
                    email_queue_workers=1, link_queue_workers=link_workers)
 
         try:
-            # Create list of all workers
             workers = [
                 self._email_monitoring_loop(),
                 self._email_processing_loop(),
@@ -338,10 +308,8 @@ def setup_signal_handlers(app: NetflixHouseholdUpdater) -> None:
 
 async def async_main() -> None:
     """Async main entry point."""
-    # Load settings
-    settings = load_settings()
 
-    # Setup logging
+    settings = load_settings()
     setup_logging(settings)
 
     logger.info(
@@ -351,13 +319,9 @@ async def async_main() -> None:
         mailbox=settings.mailbox_name,
     )
 
-    # Create and run application
     app = NetflixHouseholdUpdater(settings)
-
-    # Setup signal handlers
     setup_signal_handlers(app)
 
-    # Run application
     try:
         await app.run()
     except KeyboardInterrupt:

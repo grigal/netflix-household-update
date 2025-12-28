@@ -45,6 +45,12 @@ class Settings(BaseSettings):
         le=3600,
         description="Polling interval (only used if IMAP IDLE not available)",
     )
+    idle_timeout_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=1740,
+        description="IMAP IDLE timeout in seconds (default 5 minutes, max 29 minutes per RFC 2177)",
+    )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
     )
@@ -81,6 +87,15 @@ class Settings(BaseSettings):
         if not v or not v.strip():
             raise ValueError("Field cannot be empty")
         return v.strip()
+
+    @field_validator("sender_emails")
+    @classmethod
+    def validate_sender_emails(cls, v: list[str]) -> list[str]:
+        """Ensure at least one authorized sender exists."""
+        if not v or len(v) == 0:
+            raise ValueError("At least one authorized sender email must be configured")
+        # Strip whitespace from all sender emails
+        return [email.strip() for email in v if email.strip()]
 
     @field_validator("database_path")
     @classmethod

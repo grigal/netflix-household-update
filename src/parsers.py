@@ -60,6 +60,28 @@ class EmailParser:
 
         return is_authorized
 
+    def is_household_update_email(self, msg: Message) -> bool:
+        """Check if email is a Netflix household update email by subject.
+
+        Args:
+            msg: Parsed email message
+
+        Returns:
+            True if subject contains household update text
+        """
+        subject = msg.get("Subject", "")
+
+        is_household_update = "Important: How to update your Netflix Household" in subject
+
+        if is_household_update:
+            logger.info("email_is_household_update", subject=subject)
+        else:
+            logger.info("email_filtered_by_subject",
+                       subject=subject,
+                       reason="Not a household update email")
+
+        return is_household_update
+
     def extract_html_body(self, msg: Message) -> Optional[str]:
         """Extract HTML body from multipart email.
 
@@ -199,6 +221,10 @@ class NetflixEmailProcessor:
 
         # Verify sender
         if not self.email_parser.is_from_authorized_sender(msg):
+            return None
+
+        # Check if this is a household update email by subject
+        if not self.email_parser.is_household_update_email(msg):
             return None
 
         # Extract HTML body

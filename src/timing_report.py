@@ -28,6 +28,8 @@ class TimingReportProcessor:
         """
         self.output_dir = output_dir
         self._pending_timings = {}  # Store timing data by URL
+        self._notification_timestamps = {}  # Track notification start times by email_id
+        self._link_to_email_id = {}  # Map links to email IDs for end-to-end tracking
 
     def __call__(self, logger, method_name, event_dict):
         """Process log events and generate reports when appropriate.
@@ -42,8 +44,22 @@ class TimingReportProcessor:
         """
         event = event_dict.get("event")
 
+        # Track email notification arrival (start of end-to-end flow)
+        if event == "email_notification_received":
+            email_id = event_dict.get("email_id")
+            notification_timestamp = event_dict.get("notification_timestamp")
+            if email_id and notification_timestamp:
+                self._notification_timestamps[email_id] = notification_timestamp
+
+        # Track link extraction (map link to email_id)
+        elif event == "link_extracted_from_email":
+            email_id = event_dict.get("email_id")
+            link = event_dict.get("link")
+            if email_id and link:
+                self._link_to_email_id[link] = email_id
+
         # Capture timing breakdown
-        if event == "verification_timing_breakdown":
+        elif event == "verification_timing_breakdown":
             url = event_dict.get("url", "unknown")
             self._pending_timings[url] = {
                 "total": event_dict.get("total_seconds", 0),
@@ -56,7 +72,28 @@ class TimingReportProcessor:
                 "click_confirmation": event_dict.get("click_confirmation_seconds", 0),
             }
 
-        # Generate report when verification completes successfully
+        # Generate report when end-to-end verification completes
+        elif event == "end_to_end_verification_completed":
+            link = event_dict.get("link", "unknown")
+            verification_timestamp = event_dict.get("verification_timestamp")
+            success = event_dict.get("success", False)
+
+            # Get timing data if available
+            timings = self._pending_timings.pop(link, {})
+
+            # Calculate end-to-end time if we have the notification timestamp
+            if link in self._link_to_email_id:
+                email_id = self._link_to_email_id.pop(link)
+                if email_id in self._notification_timestamps:
+                    notification_timestamp = self._notification_timestamps.pop(email_id)
+                    end_to_end_seconds = verification_timestamp - notification_timestamp
+                    timings["end_to_end"] = end_to_end_seconds
+
+            # Save report with end-to-end timing
+            if timings:
+                self._save_report(success=success, timings=timings, link=link)
+
+        # Also handle legacy verification_completed events (backward compatibility)
         elif event == "verification_completed":
             url = event_dict.get("url", "unknown")
             if url in self._pending_timings:
@@ -129,8 +166,12 @@ def save_verification_timing_report(
         ]
 
         # Add detailed timing breakdown
+        if "end_to_end" in timings:
+            report_lines.append(f"End-to-End Time (Notification → Verification): {timings['end_to_end']:.3f}s")
+            report_lines.append("")
+
         if "total" in timings:
-            report_lines.append(f"Total Time: {timings['total']:.3f}s")
+            report_lines.append(f"Browser Verification Time: {timings['total']:.3f}s")
             report_lines.append("")
 
         report_lines.append("Step-by-Step Breakdown:")
@@ -166,17 +207,29 @@ def save_verification_timing_report(
         report_lines.append("=" * 70)
         report_lines.append("")
 
-        # Calculate percentages
+        # Calculate percentages and show end-to-end breakdown
+        end_to_end = timings.get("end_to_end", 0)
         total = timings.get("total", 0)
+
+        if end_to_end > 0:
+            # Show what portion of end-to-end time is browser vs queue/email processing
+            browser_pct = (total / end_to_end) * 100 if total > 0 else 0
+            queue_and_processing = end_to_end - total
+            queue_pct = (queue_and_processing / end_to_end) * 100
+
+            report_lines.append(f"Browser Verification: {browser_pct:5.1f}% of end-to-end ({total:.3f}s)")
+            report_lines.append(f"Queue + Email Proc:   {queue_pct:5.1f}% of end-to-end ({queue_and_processing:.3f}s)")
+            report_lines.append("")
+
         if total > 0:
             page_load_pct = (timings.get("page_load", 0) / total) * 100
             login_pct = (timings.get("login_process", 0) / total) * 100
             click_pct = (timings.get("click_confirmation", 0) / total) * 100
 
-            report_lines.append(f"Page Load:        {page_load_pct:5.1f}% of total time")
+            report_lines.append(f"Page Load:        {page_load_pct:5.1f}% of browser time")
             if login_pct > 0:
-                report_lines.append(f"Login Process:    {login_pct:5.1f}% of total time")
-            report_lines.append(f"Click Confirm:    {click_pct:5.1f}% of total time")
+                report_lines.append(f"Login Process:    {login_pct:5.1f}% of browser time")
+            report_lines.append(f"Click Confirm:    {click_pct:5.1f}% of browser time")
             report_lines.append("")
 
             # Identify bottleneck

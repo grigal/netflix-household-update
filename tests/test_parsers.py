@@ -411,7 +411,7 @@ class TestNetflixEmailProcessor:
         # Arrange
         raw_email = b"""From: info@netflix.com
 To: user@example.com
-Subject: Update your Netflix Household
+Subject: Important: How to update your Netflix Household
 Content-Type: text/html
 
 <html>
@@ -506,6 +506,7 @@ Content-Type: text/html
         """
         # Arrange
         raw_email = b"""From: info@netflix.com
+Subject: Important: How to update your Netflix Household
 Content-Type: multipart/alternative; boundary="boundary"
 
 --boundary
@@ -542,6 +543,7 @@ Content-Type: text/html
         )
 
         raw_email = b"""From: noreply@netflix.com
+Subject: Important: How to update your Netflix Household
 Content-Type: text/html
 
 <html><body>
@@ -572,6 +574,7 @@ Content-Type: text/html
         )
 
         raw_email = b"""From: info@netflix.com
+Subject: Important: How to update your Netflix Household
 Content-Type: text/html
 
 <html><body>

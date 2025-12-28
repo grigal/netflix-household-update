@@ -25,6 +25,7 @@ def mock_settings():
     settings.move_to_mailbox_name = "Processed"
     settings.sender_emails = ["info@netflix.com"]
     settings.netflix_link_patterns = ["netflix.com/account/update-primary-location"]
+    settings.idle_timeout_seconds = 300
     return settings
 
 
@@ -158,40 +159,39 @@ class TestEmailMonitorFetch:
     @pytest.mark.asyncio
     async def test_fetch_email_by_id_success(self, email_monitor):
         """
-        CONTRACT: fetch_email_by_id(email_id: str)
-        INPUT: Valid email ID as string (e.g., "12345")
-        OUTPUT: Tuple of (email_id, raw_email_bytes)
-        SIDE EFFECTS: Executes IMAP FETCH command
+        CONTRACT: fetch_email_by_id(email_uid: str)
+        INPUT: Valid email UID as string (e.g., "28399")
+        OUTPUT: Tuple of (email_uid, raw_email_bytes)
+        SIDE EFFECTS: Executes IMAP UID FETCH command
         """
         # Arrange
-        email_id = "12345"
+        email_uid = "28399"
         mock_command_client = AsyncMock()
         email_monitor.command_client = mock_command_client
 
-        # Mock BODY.PEEK[] fetch using "*" (last message)
-        # The code now uses "*" instead of email_id for fetching
+        # Mock UID FETCH response
         raw_email_data = b'From: test@example.com\r\nSubject: Test\r\n\r\nBody'
         fetch_response = Mock()
         fetch_response.result = "OK"
         fetch_response.lines = [
-            b'12345 FETCH (BODY.PEEK[] {45}',
+            b'152 FETCH (UID 28399 BODY[] {45}',
             bytearray(raw_email_data)
         ]
 
-        mock_command_client.fetch = AsyncMock(return_value=fetch_response)
+        mock_command_client.uid = AsyncMock(return_value=fetch_response)
 
         # Act
-        result = await email_monitor.fetch_email_by_id(email_id)
+        result = await email_monitor.fetch_email_by_id(email_uid)
 
         # Assert
         assert result is not None
-        result_id, result_email = result
-        assert result_id == email_id
+        result_uid, result_email = result
+        assert result_uid == email_uid
         assert result_email == raw_email_data
         assert isinstance(result_email, bytes)
 
-        # Verify it fetched using "*" not the email_id
-        mock_command_client.fetch.assert_awaited_once_with("*", "(BODY.PEEK[])")
+        # Verify it used UID FETCH
+        mock_command_client.uid.assert_awaited_once_with("fetch", email_uid, "(BODY.PEEK[])")
 
     @pytest.mark.asyncio
     async def test_fetch_email_by_id_not_found(self, email_monitor):
@@ -271,39 +271,38 @@ class TestEmailMonitorMove:
     @pytest.mark.asyncio
     async def test_move_email_to_folder_success(self, email_monitor, mock_settings):
         """
-        CONTRACT: move_email_to_folder(email_id: str)
-        INPUT: Valid email ID
+        CONTRACT: move_email_to_folder(email_uid: str)
+        INPUT: Valid email UID
         OUTPUT: None
         SIDE EFFECTS:
-            - Marks email as \\Seen
-            - Copies email to move_to_mailbox_name
-            - Marks email as \\Deleted
+            - Marks email as \\Seen using UID STORE
+            - Copies email to move_to_mailbox_name using UID COPY
+            - Marks email as \\Deleted using UID STORE
         """
         # Arrange
-        email_id = "12345"
+        email_uid = "28399"
         mock_command_client = AsyncMock()
-        mock_command_client.store = AsyncMock()
-        mock_command_client.copy = AsyncMock()
+        mock_command_client.uid = AsyncMock()
         email_monitor.command_client = mock_command_client
 
         # Act
-        await email_monitor.move_email_to_folder(email_id)
+        await email_monitor.move_email_to_folder(email_uid)
 
-        # Assert
-        # Verify email marked as read
-        mock_command_client.store.assert_any_call(email_id, "+FLAGS", r"(\Seen)")
+        # Assert - verify all UID commands were called
+        # Email marked as read
+        mock_command_client.uid.assert_any_call("store", email_uid, "+FLAGS", r"(\Seen)")
 
-        # Verify email copied to processed folder
-        mock_command_client.copy.assert_awaited_once_with(email_id, "Processed")
+        # Email copied to processed folder
+        mock_command_client.uid.assert_any_call("copy", email_uid, "Processed")
 
-        # Verify email marked as deleted
-        mock_command_client.store.assert_any_call(email_id, "+FLAGS", r"(\Deleted)")
+        # Email marked as deleted
+        mock_command_client.uid.assert_any_call("store", email_uid, "+FLAGS", r"(\Deleted)")
 
     @pytest.mark.asyncio
     async def test_move_email_to_folder_move_disabled(self, email_monitor, mock_settings):
         """
-        CONTRACT: move_email_to_folder(email_id: str)
-        INPUT: Valid email ID, move_emails_to_mailbox=False
+        CONTRACT: move_email_to_folder(email_uid: str)
+        INPUT: Valid email UID, move_emails_to_mailbox=False
         OUTPUT: None
         SIDE EFFECTS: Only marks email as \\Seen (no copy/delete)
         """
@@ -311,22 +310,20 @@ class TestEmailMonitorMove:
         mock_settings.move_emails_to_mailbox = False
         email_monitor.settings = mock_settings
 
-        email_id = "12345"
+        email_uid = "28399"
         mock_command_client = AsyncMock()
-        mock_command_client.store = AsyncMock()
-        mock_command_client.copy = AsyncMock()
+        mock_command_client.uid = AsyncMock()
         email_monitor.command_client = mock_command_client
 
         # Act
-        await email_monitor.move_email_to_folder(email_id)
+        await email_monitor.move_email_to_folder(email_uid)
 
         # Assert
-        # Verify email marked as read
-        mock_command_client.store.assert_awaited_once_with(email_id, "+FLAGS", r"(\Seen)")
+        # Verify email marked as read using UID STORE
+        mock_command_client.uid.assert_awaited_once_with("store", email_uid, "+FLAGS", r"(\Seen)")
 
-        # Verify NO copy or delete operations
-        mock_command_client.copy.assert_not_called()
-        assert mock_command_client.store.call_count == 1
+        # Verify NO copy or delete operations (only 1 uid call)
+        assert mock_command_client.uid.call_count == 1
 
     @pytest.mark.asyncio
     async def test_expunge_deleted_success(self, email_monitor, mock_settings):
@@ -378,8 +375,8 @@ class TestEmailMonitorIdle:
         """
         CONTRACT: wait_for_new_emails_idle(timeout: int)
         INPUT: Timeout in seconds
-        OUTPUT: Email ID as string when new email arrives
-        SIDE EFFECTS: Enters IMAP IDLE mode, waits for server push
+        OUTPUT: List of email UIDs when new emails arrive
+        SIDE EFFECTS: Enters IMAP IDLE mode, uses UID SEARCH UNSEEN
         """
         # Arrange
         mock_idle_client = AsyncMock()
@@ -392,16 +389,26 @@ class TestEmailMonitorIdle:
         mock_response.lines = [b'28396 EXISTS']
         mock_idle_client.wait_server_push.return_value = mock_response
 
+        # Mock command client for UID SEARCH
+        mock_command_client = AsyncMock()
+        search_response = Mock()
+        search_response.result = "OK"
+        search_response.lines = [b'SEARCH 28399 28400']
+        mock_command_client.uid_search = AsyncMock(return_value=search_response)
+
         email_monitor.idle_client = mock_idle_client
+        email_monitor.command_client = mock_command_client
 
         # Act
         result = await email_monitor.wait_for_new_emails_idle(timeout=1740)
 
         # Assert
-        assert result == "28396"
+        assert result == ["28399", "28400"]
         mock_idle_client.idle_start.assert_awaited_once_with(timeout=1740)
         mock_idle_client.wait_server_push.assert_awaited_once_with(timeout=1740)
         mock_idle_client.idle_done.assert_called_once()
+        # Verify server-side filtering with FROM criteria
+        mock_command_client.uid_search.assert_awaited_once_with('UNSEEN FROM "info@netflix.com"')
 
     @pytest.mark.asyncio
     async def test_wait_for_new_emails_idle_timeout(self, email_monitor):
@@ -422,7 +429,10 @@ class TestEmailMonitorIdle:
         mock_response.lines = []
         mock_idle_client.wait_server_push.return_value = mock_response
 
+        mock_command_client = AsyncMock()
+
         email_monitor.idle_client = mock_idle_client
+        email_monitor.command_client = mock_command_client
 
         # Act
         result = await email_monitor.wait_for_new_emails_idle(timeout=1740)
@@ -440,13 +450,80 @@ class TestEmailMonitorIdle:
         """
         # Arrange
         mock_idle_client = Mock()  # No idle_start method
+        mock_command_client = AsyncMock()
+
         email_monitor.idle_client = mock_idle_client
+        email_monitor.command_client = mock_command_client
 
         # Act
         result = await email_monitor.wait_for_new_emails_idle()
 
         # Assert
         assert result is None
+
+
+class TestEmailMonitorSearchQuery:
+    """Test IMAP search query building for server-side filtering."""
+
+    def test_build_sender_search_query_single_sender(self, email_monitor, mock_settings):
+        """
+        CONTRACT: _build_sender_search_query()
+        INPUT: Settings with single sender email
+        OUTPUT: IMAP search query with FROM criteria
+        """
+        # Arrange
+        mock_settings.sender_emails = ["info@netflix.com"]
+
+        # Act
+        query = email_monitor._build_sender_search_query()
+
+        # Assert
+        assert query == 'UNSEEN FROM "info@netflix.com"'
+
+    def test_build_sender_search_query_two_senders(self, email_monitor, mock_settings):
+        """
+        CONTRACT: _build_sender_search_query()
+        INPUT: Settings with two sender emails
+        OUTPUT: IMAP search query with OR syntax for two senders
+        """
+        # Arrange
+        mock_settings.sender_emails = ["info@netflix.com", "noreply@netflix.com"]
+
+        # Act
+        query = email_monitor._build_sender_search_query()
+
+        # Assert
+        assert query == 'UNSEEN OR FROM "info@netflix.com" FROM "noreply@netflix.com"'
+
+    def test_build_sender_search_query_three_senders(self, email_monitor, mock_settings):
+        """
+        CONTRACT: _build_sender_search_query()
+        INPUT: Settings with three sender emails
+        OUTPUT: IMAP search query with nested OR syntax
+        """
+        # Arrange
+        mock_settings.sender_emails = ["info@netflix.com", "noreply@netflix.com", "support@netflix.com"]
+
+        # Act
+        query = email_monitor._build_sender_search_query()
+
+        # Assert
+        assert query == 'UNSEEN OR (OR FROM "info@netflix.com" FROM "noreply@netflix.com") FROM "support@netflix.com"'
+
+    def test_build_sender_search_query_four_senders(self, email_monitor, mock_settings):
+        """
+        CONTRACT: _build_sender_search_query()
+        INPUT: Settings with four sender emails
+        OUTPUT: IMAP search query with deeply nested OR syntax
+        """
+        # Arrange
+        mock_settings.sender_emails = ["a@netflix.com", "b@netflix.com", "c@netflix.com", "d@netflix.com"]
+
+        # Act
+        query = email_monitor._build_sender_search_query()
+
+        # Assert
+        assert query == 'UNSEEN OR (OR (OR FROM "a@netflix.com" FROM "b@netflix.com") FROM "c@netflix.com") FROM "d@netflix.com"'
 
 
 class TestEmailMonitorProcessing:
@@ -470,7 +547,7 @@ class TestEmailMonitorProcessing:
 
         # Mock fetch_email_by_id
         raw_email = b'''From: info@netflix.com
-Subject: Update your Netflix Household
+Subject: Important: How to update your Netflix Household
 Content-Type: text/html
 
 <html>

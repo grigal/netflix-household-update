@@ -1,107 +1,192 @@
 # Netflix Household Updater
 
-*Netflix Location Updater* is an easy to use python script to automatically fetch the location update 
-Email from an Email mailbox and click the confirmation link in it.
-Script can easily run on a Raspberry Pi. There is also support to run it on Docker.
+Automated Netflix household location verification using async Python. Monitors your email inbox via IMAP IDLE (push notifications), extracts verification links, and uses headless browser automation to confirm household updates.
 
 ## Features
 
-- Automatically polling of Email mailbox for given polling intervall
-- Netflix Email fetching and automatically household confirmation
-- Moving the Netflix Email into a separate subfolder of mailbox
-- Logging file with info and error messages
+- **IMAP IDLE monitoring** - Push notifications instead of polling (instant detection)
+- **Dual-queue architecture** - Parallel email detection during browser verification
+- **UID-based operations** - Race-condition free email handling
+- **Subject-based filtering** - Only processes household update emails
+- **Configurable IDLE timeout** - Optimized for Gmail (default 5 minutes)
+- **End-to-end timing metrics** - Performance tracking from notification to verification
+- **Automatic email management** - Moves processed emails to separate folder
+- **Structured logging** - JSON-compatible logs for monitoring
+- **Comprehensive testing** - 62 tests with mock IMAP server
 
-## Quickstart
-
-Basic installation instruction
+## Quick Start
 
 ### Installation
 
-To install all dependencies, simply install the requirements first:
+**Requirements:** Python 3.11+
 
-    python -m pip install -r requirements.txt
+```bash
+# Clone repository
+git clone https://github.com/grigal/netflix-household-update.git
+cd netflix-household-update
+
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# Install dependencies
+pip install -e .
+
+# Install Playwright browsers
+playwright install chromium
+```
+
+### Configuration
+
+Create a `.env` file with your credentials:
+
+```bash
+# Required
+IMAP_SERVER=imap.gmail.com
+IMAP_USER=your@email.com
+IMAP_PASS=your_app_password
+NETFLIX_USER=netflix@example.com
+NETFLIX_PASS=netflix_password
+
+# Optional
+IDLE_TIMEOUT_SECONDS=300  # 5 minutes (default)
+IMAP_PORT=993
+MAILBOX_NAME=INBOX
+MOVE_EMAILS_TO_MAILBOX=true
+MOVE_TO_MAILBOX_NAME=Netflix
+LOG_LEVEL=INFO
+```
+
+**Gmail users:** Generate an [App Password](https://myaccount.google.com/apppasswords) instead of using your account password.
 
 ### Usage
 
-Make sure to add required credential to your environment variables correct parameters for the Email mailbox, first!
-The options for the variables are:
-Required:
-- `IMAP_SERVER` - The IMAP server from which to poll Netflix emails. (e.g. `imap.gmail.com`) 
-- `IMAP_USER` - The login username for your IMAP server 
-- `IMAP_PASS` - The login passsword for your IMAP server (for gmail, you might need to create an "App Password")
-- `NETFLIX_USER` - The login username for your Netflix account
-- `NETFLIX_PASS` - The login password for your Netflix password
-  
-  Optional:
-- `POLLING_TIME_IN_SECONDS` - (Default: 2) - Frequency in seconds on how often to check for Netflix emails in the specified mailbox.
-- `IMAP_PORT` - (Default: 993) - The port for your IMAP server.
-- `MAILBOX_NAME` - (Default: INBOX) - The mailbox folder name from which to poll Netflix emails
-- `MoveEmailsToMailbox` - (Default: True) - Enables moving confirmed/processed Netlix emails to a separate mail folder
-- `MoveToMailboxName` - (Default: Netflix) - If the option above is enabled, this specifies the folder name where to move the processed emails.
-
-To run the script, simply execute the following command:
-
-    python netflix_household_update.py
-
-The script will run in an infinite loop and polls the Email mailbox with the default polling time of 2 seconds.
-The script can be aborted by pressing **Ctrl+C**
-
-### Installation on Raspberry Pi
-
-To start the script at the startup of Raspberry Pi, crontab can be used. 
-For the following commands, it is assumed that the default user *pi* exists. If not, replace the username with the correct one'
-The easiest way ist to use SSH connection and execute the following commands:
-
-    cd /home/pi
-    git clone https://github.com/f1shl/netflix-household-update.git
-    cd netflix-household-update
-    python -m venv .venv
-    .venv/bin/pip install -r requirements.txt
-
-Now update all the parameters in the config.ini with your own Email provider data.
-Start the script and check if it runs without errors.
-If everything works, break with **CTRL+C**
-
-Edit crontab:
-
-    crontab -e
-
-Select nano as editor. Go to the end of the file and add the following line:
-
-    @reboot /home/pi/netflix-household-update/netflix-household-update-launcher.sh &
-
-Save with **CTRL+X**, **Y** and finally press **Return**
-Now restart the Raspberry Pi:
-
-    sudo reboot
-
-The script should now be started after each startup and runs in an infinite loop.
-
-### Launch on Docker
-First, you need to build the container using:
-`docker build -t [docker-image-name]:latest .`
-
-docker run --name [docker-container-name] \
-            -e IMAP_SERVER=[imap-server] \
-            -e IMAP_USER=[imap-user] \
-            -e IMAP_PASS=[imap-password] \
-            -e NETFLIX_USER=[netflix-username] \
-            -e NETFLIX_PASS=[netflix-passsword] \
-            [docker-image-name]:latest
-
-Or run in with Docker-Compose:
+```bash
+python src/main.py
 ```
-version: '3.8'
 
-services:
-    netflix-updater:
-      container_name: netflix-updater
-      image: [docker-image-name]:latest
-      restart: unless-stopped
-      environment:
-        - IMAP_SERVER=[imap-server]
-        - IMAP_USER=[imap-user]
-        - IMAP_PASS=[imap-password]
-        - NETFLIX_USER=[netflix-username]
-        - NETFLIX_PASS=[netflix-passsword]
+The application will:
+1. Connect to your IMAP server
+2. Enter IDLE mode (waiting for emails)
+3. Detect Netflix household emails instantly
+4. Extract verification links
+5. Open links in headless browser
+6. Click confirmation button
+7. Save timing reports to `metrics/`
+
+Press **Ctrl+C** to stop gracefully.
+
+## Advanced Configuration
+
+### Environment Variables Reference
+
+**IMAP Settings:**
+- `IMAP_SERVER` - IMAP server address (e.g., `imap.gmail.com`)
+- `IMAP_PORT` - IMAP port (default: `993`)
+- `IMAP_USER` - Email username
+- `IMAP_PASS` - Email password (use App Password for Gmail)
+
+**Netflix Settings:**
+- `NETFLIX_USER` - Netflix account email
+- `NETFLIX_PASS` - Netflix account password
+
+**Email Filtering:**
+- `SENDER_EMAILS` - Comma-separated authorized senders (default: `info@account.netflix.com`)
+- `NETFLIX_LINK_PATTERNS` - Comma-separated URL patterns to match
+
+**Performance Tuning:**
+- `IDLE_TIMEOUT_SECONDS` - IDLE timeout in seconds (60-1740, default: `300`)
+  - Lower = more frequent reconnections, potentially faster Gmail detection
+  - Higher = fewer reconnections, lower network overhead
+- `POLLING_TIME_IN_SECONDS` - Fallback polling interval if IDLE unsupported (default: `60`)
+
+**Email Management:**
+- `MAILBOX_NAME` - Mailbox to monitor (default: `INBOX`)
+- `MOVE_EMAILS_TO_MAILBOX` - Move processed emails (default: `true`)
+- `MOVE_TO_MAILBOX_NAME` - Destination folder (default: `Netflix`)
+
+**Logging:**
+- `LOG_LEVEL` - Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+### Performance Optimization
+
+**Gmail IDLE Delays:**
+Gmail's IMAP IDLE has inherent 1-3 minute server-side delays. To optimize:
+- Default 5-minute timeout balances reconnection frequency
+- Reduce to 3 minutes (`IDLE_TIMEOUT_SECONDS=180`) for slightly faster detection
+- Increase to 15 minutes for fewer reconnections in stable environments
+
+**Metrics & Monitoring:**
+Timing reports saved to `metrics/verification_YYYYMMDD_HHMMSS_*.txt` include:
+- End-to-end time (notification → verification)
+- Queue + email processing time
+- Browser verification breakdown
+- Performance bottleneck analysis
+
+## Testing
+
+Run the comprehensive test suite:
+
+```bash
+# Run all tests
+pytest tests/ -v
+
+# Run with coverage
+pytest tests/ --cov=src --cov-report=html
+
+# Run specific test file
+pytest tests/test_email_monitor.py -v
 ```
+
+**Test Coverage:**
+- Email monitoring (IMAP IDLE, UID operations)
+- Email parsing (sender/subject validation)
+- Link extraction (HTML parsing)
+- Browser automation (mocked)
+- End-to-end flows (mock IMAP server)
+
+## Architecture & Implementation
+
+See [TECHNICAL_OVERVIEW.md](TECHNICAL_OVERVIEW.md) for complete technical documentation:
+- Core components and workflows
+- Dual-queue architecture and performance benefits
+- Gmail-specific adaptations
+- UID-based operations
+- Configuration reference
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for security best practices:
+- Credential management
+- Gmail App Passwords
+- Production deployment
+- Audit logging
+
+**Never commit credentials to git.** Use `.env` file (excluded by `.gitignore`).
+
+## Troubleshooting
+
+**Gmail not detecting emails:**
+- Verify App Password (not account password)
+- Check `SENDER_EMAILS` includes authorized senders
+- Reduce `IDLE_TIMEOUT_SECONDS` to 180 (3 minutes)
+- Check logs for `email_filtered_by_subject` messages
+
+**Subject filtering issues:**
+- Email subject must contain exactly: `Important: How to update your Netflix Household`
+- Check logs for `email_filtered_by_subject` to see rejected subjects
+
+**Browser automation failures:**
+- Ensure Playwright browsers installed: `playwright install chromium`
+- Check `metrics/` folder for timing reports with error details
+- Verify Netflix credentials are correct
+
+## License
+
+MIT License - See [LICENSE](LICENSE)
+
+---
+
+**Documentation:**
+- [TECHNICAL_OVERVIEW.md](TECHNICAL_OVERVIEW.md) - Architecture & implementation reference
+- [SECURITY.md](SECURITY.md) - Security best practices
