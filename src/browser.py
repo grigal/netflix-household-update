@@ -78,32 +78,41 @@ class NetflixBrowserAutomation:
         Returns:
             True if successful, False otherwise
         """
+        import time
+
         if not self.context:
             raise RuntimeError("Browser not initialized")
 
         page: Optional[Page] = None
+        step_start = time.time()
 
         try:
             logger.info("processing_verification_link", url=url)
 
-            # Create new page
             page = await self.context.new_page()
-
-            # Navigate to verification URL
             await page.goto(url, wait_until="networkidle", timeout=30000)
 
             logger.debug("page_loaded", url=page.url)
 
-            # Check for expired link or error messages
-            page_content = await page.content()
-            if any(msg in page_content.lower() for msg in ["expired", "invalid", "no longer valid", "link has been used"]):
+            # Check for specific Netflix error messages indicating expired/invalid link
+            page_text = await page.locator("body").inner_text()
+            error_messages = [
+                "link has expired",
+                "link is no longer valid",
+                "link has already been used",
+                "request has expired",
+                "unable to process your request"
+            ]
+            if any(msg in page_text.lower() for msg in error_messages):
                 logger.warning("verification_link_appears_expired_or_invalid", url=url)
                 await page.screenshot(path="debug_expired_link.png")
                 logger.info("screenshot_saved", path="debug_expired_link.png")
                 return False
 
             # Check if we need to login
-            if await self._is_login_page(page):
+            login_needed = await self._is_login_page(page)
+
+            if login_needed:
                 logger.info("login_required")
                 success = await self._login_to_netflix(page)
 
@@ -117,10 +126,14 @@ class NetflixBrowserAutomation:
             # Click the confirmation button
             success = await self._click_confirmation_button(page)
 
-            if success:
-                logger.info("verification_completed", url=url)
-            else:
-                logger.error("verification_failed", url=url)
+            # Log only total browser verification time
+            total_time = time.time() - step_start
+            logger.info(
+                "browser_verification_completed",
+                url=url,
+                duration_seconds=round(total_time, 2),
+                success=success
+            )
 
             return success
 
@@ -244,9 +257,6 @@ class NetflixBrowserAutomation:
 
             logger.info("confirmation_button_clicked")
 
-            # Wait a moment for action to complete
-            await asyncio.sleep(2)
-
             return True
 
         except Exception as e:
@@ -302,6 +312,8 @@ class BrowserPool:
         Returns:
             True if successful
         """
+        import time
+
         async with self._semaphore:
             # Use first available browser (simple round-robin)
             browser = self.browsers[0] if self.browsers else None
@@ -310,4 +322,5 @@ class BrowserPool:
                 logger.error("no_browser_available")
                 return False
 
-            return await browser.process_verification_link(url)
+            result = await browser.process_verification_link(url)
+            return result

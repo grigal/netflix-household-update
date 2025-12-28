@@ -28,7 +28,8 @@ class EmailMonitor:
             settings: Application settings
         """
         self.settings = settings
-        self.client: Optional[aioimaplib.IMAP4_SSL] = None
+        self.idle_client: Optional[aioimaplib.IMAP4_SSL] = None
+        self.command_client: Optional[aioimaplib.IMAP4_SSL] = None
         self.email_processor = NetflixEmailProcessor(
             sender_emails=settings.sender_emails,
             link_patterns=settings.netflix_link_patterns,
@@ -37,7 +38,8 @@ class EmailMonitor:
 
     async def connect(self) -> None:
         """Connect to IMAP server with retry logic."""
-        await self._connect_with_retry()
+        await self._connect_idle_client()
+        await self._connect_command_client()
 
     @retry(
         retry=retry_if_exception_type((aioimaplib.AioImapException, ConnectionError)),
@@ -45,158 +47,122 @@ class EmailMonitor:
         wait=wait_exponential(multiplier=1, min=2, max=30),
         reraise=True,
     )
-    async def _connect_with_retry(self) -> None:
-        """Connect to IMAP server with exponential backoff retry."""
+    async def _connect_idle_client(self) -> None:
+        """Connect IDLE client to IMAP server."""
         try:
             logger.info(
-                "connecting_to_imap",
+                "connecting_idle_client_to_imap",
                 server=self.settings.imap_server,
                 port=self.settings.imap_port,
             )
 
-            self.client = aioimaplib.IMAP4_SSL(
+            self.idle_client = aioimaplib.IMAP4_SSL(
                 host=self.settings.imap_server,
                 port=self.settings.imap_port,
             )
 
-            await self.client.wait_hello_from_server()
+            await self.idle_client.wait_hello_from_server()
 
-            # Login
-            result = await self.client.login(
+            result = await self.idle_client.login(
                 self.settings.imap_user,
                 self.settings.get_imap_password(),
             )
 
             if result.result != "OK":
-                raise aioimaplib.AioImapException(f"Login failed: {result}")
+                raise aioimaplib.AioImapException(f"Idle client login failed: {result}")
 
-            # Select mailbox
-            result = await self.client.select(self.settings.mailbox_name)
+            result = await self.idle_client.select(self.settings.mailbox_name)
 
             if result.result != "OK":
-                raise aioimaplib.AioImapException(f"Mailbox selection failed: {result}")
+                raise aioimaplib.AioImapException(f"Idle client mailbox selection failed: {result}")
 
-            # Create Netflix folder if needed
-            if self.settings.move_emails_to_mailbox:
-                await self.client.create(self.settings.move_to_mailbox_name)
-
-            logger.info("imap_connected", mailbox=self.settings.mailbox_name)
+            logger.info("idle_client_connected", mailbox=self.settings.mailbox_name)
 
         except Exception as e:
-            logger.error("imap_connection_failed", error=str(e), exc_info=True)
+            logger.error("idle_client_connection_failed", error=str(e), exc_info=True)
+            raise
+
+    @retry(
+        retry=retry_if_exception_type((aioimaplib.AioImapException, ConnectionError)),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    async def _connect_command_client(self) -> None:
+        """Connect command client to IMAP server."""
+        try:
+            logger.info(
+                "connecting_command_client_to_imap",
+                server=self.settings.imap_server,
+                port=self.settings.imap_port,
+            )
+
+            self.command_client = aioimaplib.IMAP4_SSL(
+                host=self.settings.imap_server,
+                port=self.settings.imap_port,
+            )
+
+            await self.command_client.wait_hello_from_server()
+
+            result = await self.command_client.login(
+                self.settings.imap_user,
+                self.settings.get_imap_password(),
+            )
+
+            if result.result != "OK":
+                raise aioimaplib.AioImapException(f"Command client login failed: {result}")
+
+            result = await self.command_client.select(self.settings.mailbox_name)
+
+            if result.result != "OK":
+                raise aioimaplib.AioImapException(f"Command client mailbox selection failed: {result}")
+
+            if self.settings.move_emails_to_mailbox:
+                await self.command_client.create(self.settings.move_to_mailbox_name)
+
+            logger.info("command_client_connected", mailbox=self.settings.mailbox_name)
+
+        except Exception as e:
+            logger.error("command_client_connection_failed", error=str(e), exc_info=True)
             raise
 
     async def disconnect(self) -> None:
         """Disconnect from IMAP server."""
-        if self.client:
+        if self.idle_client:
             try:
-                await self.client.logout()
-                logger.info("imap_disconnected")
+                await self.idle_client.logout()
+                logger.info("idle_client_disconnected")
             except Exception as e:
-                logger.warning("imap_disconnect_error", error=str(e))
+                logger.warning("idle_client_disconnect_error", error=str(e))
             finally:
-                self.client = None
+                self.idle_client = None
 
-    async def fetch_unread_emails(self) -> AsyncIterator[tuple[bytes, bytes]]:
-        """Fetch unread emails from Netflix.
-
-        Yields:
-            Tuple of (email_id, raw_email_data)
-        """
-        if not self.client:
-            raise RuntimeError("IMAP client not connected")
-
-        # Search for unread emails from Netflix
-        # TODO: Temporarily accepting tomas.grigal@gmail.com for testing
-        search_criteria = 'UNSEEN (OR FROM "Netflix" FROM "tomas.grigal@gmail.com")'
-        result = await self.client.search(search_criteria)
-
-        if result.result != "OK":
-            logger.warning("email_search_failed", result=result)
-            return
-
-        # Parse email IDs
-        email_ids = result.lines[0].split() if result.lines else []
-
-        if not email_ids:
-            logger.debug("no_unread_emails")
-            return
-
-        logger.info("found_unread_emails", count=len(email_ids))
-
-        # Fetch each email
-        for email_id in email_ids:
+        if self.command_client:
             try:
-                # Convert bytes to string if needed
-                email_id_str = email_id.decode() if isinstance(email_id, bytes) else email_id
-                result = await self.client.fetch(email_id_str, "(RFC822)")
-
-                if result.result != "OK":
-                    logger.warning("email_fetch_failed", email_id=email_id, result=str(result))
-                    continue
-
-                # Extract raw email from response
-                # Response format: [b'1 FETCH (RFC822 {size}', b'raw email data...', b')']
-                # The RFC822 data is typically in the second element
-                raw_email = None
-
-                # Log the response structure for debugging
-                logger.debug("fetch_response_debug",
-                           email_id=email_id,
-                           result_lines_count=len(result.lines),
-                           first_few_lines=[str(line[:100]) for line in result.lines[:3]])
-
-                # aioimaplib FETCH response structure:
-                # result.lines[0]: b'ID FETCH (RFC822 {size}'
-                # result.lines[1]: bytearray or bytes with actual email data
-                # result.lines[2+]: additional data and closing paren
-                if len(result.lines) >= 2:
-                    # The actual email data is usually in index 1
-                    raw_email = result.lines[1]
-
-                    # Convert bytearray to bytes if needed
-                    if isinstance(raw_email, bytearray):
-                        raw_email = bytes(raw_email)
-
-                if raw_email and isinstance(raw_email, bytes):
-                    yield (email_id, raw_email)
-                else:
-                    logger.warning("email_data_not_found",
-                                 email_id=email_id,
-                                 lines_count=len(result.lines),
-                                 raw_email_type=str(type(raw_email)) if raw_email else "None")
-
+                await self.command_client.logout()
+                logger.info("command_client_disconnected")
             except Exception as e:
-                logger.error(
-                    "email_fetch_exception",
-                    email_id=email_id,
-                    error=str(e),
-                    exc_info=True,
-                )
+                logger.warning("command_client_disconnect_error", error=str(e))
+            finally:
+                self.command_client = None
 
-    async def move_email_to_folder(self, email_id: bytes) -> None:
-        """Move email to processed folder and mark as deleted.
+    async def move_email_to_folder(self, email_id: str) -> None:
+        """Mark email as read, move to processed folder, and mark as deleted.
 
         Args:
             email_id: Email ID to move
         """
-        if not self.client:
-            raise RuntimeError("IMAP client not connected")
-
-        if not self.settings.move_emails_to_mailbox:
-            return
+        if not self.command_client:
+            raise RuntimeError("IMAP command client not connected")
 
         try:
-            # Convert bytes to string if needed
-            email_id_str = email_id.decode() if isinstance(email_id, bytes) else email_id
+            await self.command_client.store(email_id, "+FLAGS", r"(\Seen)")
 
-            # Copy to Netflix folder
-            await self.client.copy(email_id_str, self.settings.move_to_mailbox_name)
+            if self.settings.move_emails_to_mailbox:
+                await self.command_client.copy(email_id, self.settings.move_to_mailbox_name)
+                await self.command_client.store(email_id, "+FLAGS", r"(\Deleted)")
 
-            # Mark as deleted
-            await self.client.store(email_id_str, "+FLAGS", r"(\Deleted)")
-
-            logger.debug("email_moved", email_id=email_id)
+            logger.debug("email_processed_and_moved", email_id=email_id)
 
         except Exception as e:
             logger.error(
@@ -208,46 +174,41 @@ class EmailMonitor:
 
     async def expunge_deleted(self) -> None:
         """Permanently remove emails marked as deleted."""
-        if not self.client:
-            raise RuntimeError("IMAP client not connected")
+        if not self.command_client:
+            raise RuntimeError("IMAP command client not connected")
 
         if self.settings.move_emails_to_mailbox:
             try:
-                await self.client.expunge()
+                await self.command_client.expunge()
                 logger.debug("mailbox_expunged")
             except Exception as e:
                 logger.warning("expunge_failed", error=str(e))
 
-    async def wait_for_new_emails_idle(self, timeout: int = 1740) -> bool:
+    async def wait_for_new_emails_idle(self, timeout: int = 1740) -> Optional[str]:
         """Wait for new emails using IMAP IDLE (push notifications).
 
         Args:
             timeout: IDLE timeout in seconds (default 29 minutes, RFC recommends < 30min)
 
         Returns:
-            True if new emails arrived, False if timeout or error
+            Email ID if new email arrived, None if timeout or error
         """
-        if not self.client:
-            raise RuntimeError("IMAP client not connected")
+        if not self.idle_client:
+            raise RuntimeError("IMAP idle client not connected")
 
         try:
-            # Check if server supports IDLE
-            if not hasattr(self.client, "idle_start"):
+            if not hasattr(self.idle_client, "idle_start"):
                 logger.warning("imap_idle_not_supported")
-                return False
+                return None
 
             logger.debug("entering_idle_mode", timeout=timeout)
 
-            # Enter IDLE mode
-            await self.client.idle_start(timeout=timeout)
+            await self.idle_client.idle_start(timeout=timeout)
 
-            # Wait for notification or timeout
-            result = await self.client.wait_server_push(timeout=timeout)
+            result = await self.idle_client.wait_server_push(timeout=timeout)
 
-            # Exit IDLE mode (not async)
-            self.client.idle_done()
+            self.idle_client.idle_done()
 
-            # Log what we received
             logger.info("idle_received_response", result=str(result))
 
             # Check if we got new mail notification
@@ -262,109 +223,162 @@ class EmailMonitor:
                 logger.info("idle_response_lines", lines=[str(line) for line in lines_to_check])
                 for line in lines_to_check:
                     if b"EXISTS" in line:
-                        logger.info("new_email_notification_received")
-                        return True
+                        # Extract email ID from "28382 EXISTS"
+                        try:
+                            email_id = line.split()[0].decode()
+                            logger.info("new_email_notification_received", email_id=email_id)
+                            return email_id
+                        except (ValueError, IndexError) as e:
+                            logger.warning("failed_to_parse_email_id", line=str(line), error=str(e))
+                            return None
 
             logger.info("idle_timeout_no_new_emails")
-            return False
+            return None
 
         except asyncio.TimeoutError:
             # Normal timeout - no emails arrived during IDLE period
             logger.debug("idle_timeout_expired")
-            return False
+            return None
         except Exception as e:
             # Actual errors (connection issues, protocol errors, etc.)
             logger.warning("idle_mode_failed",
                           error=str(e),
                           error_type=type(e).__name__,
                           exc_info=True)
-            return False
+            return None
 
-    async def process_emails(self) -> list[str]:
-        """Process all unread Netflix emails.
+    async def fetch_email_by_id(self, email_id: str) -> Optional[tuple[str, bytes]]:
+        """Fetch a specific email by ID.
+
+        Args:
+            email_id: IMAP email sequence number
 
         Returns:
-            List of verification links extracted
+            Tuple of (email_id, raw_email_data) or None if not found
         """
-        verification_links = []
+        if not self.command_client:
+            raise RuntimeError("IMAP command client not connected")
 
-        async for email_id, raw_email in self.fetch_unread_emails():
-            try:
-                # Extract verification link
-                link = self.email_processor.process_email(raw_email)
+        try:
+            # Log the command client state
+            logger.debug("command_client_state",
+                       email_id=email_id,
+                       has_protocol=hasattr(self.command_client, 'protocol'),
+                       protocol_state=self.command_client.protocol.state if hasattr(self.command_client, 'protocol') else 'unknown')
 
-                if link:
-                    verification_links.append(link)
-                    logger.info("verification_link_found", link=link)
+            # CRITICAL FIX: EXISTS number (e.g., 28399) is NOT the actual sequence number!
+            # EXISTS is a cumulative count including all deleted messages ever
+            # The actual current messages have sequence numbers 1-N where N is much smaller
+            # We need to fetch the LAST message using "*" which points to the highest sequence number
 
-                # Move email to processed folder
+            logger.debug("exists_id_received", exists_number=email_id)
+
+            # Use "*" to fetch the last (newest) message in the mailbox
+            actual_email_id = "*"
+            logger.info("corrected_email_id",
+                       exists_number=email_id,
+                       actual_sequence=actual_email_id,
+                       reason="EXISTS_is_not_sequence_number")
+
+            # Use BODY.PEEK[] to fetch without marking as read
+            # Will only mark as read later if it's from Netflix
+            # Note: Must use parentheses like (BODY.PEEK[]) for proper IMAP syntax
+            logger.debug("attempting_body_peek_fetch", actual_email_id=actual_email_id)
+            result = await self.command_client.fetch(actual_email_id, "(BODY.PEEK[])")
+
+            # Detailed debug logging
+            logger.debug("fetch_response_full_debug",
+                       email_id=email_id,
+                       result_status=result.result,
+                       result_lines_count=len(result.lines),
+                       all_lines=[str(line[:200]) for line in result.lines],
+                       result_type=str(type(result)),
+                       result_dir=[attr for attr in dir(result) if not attr.startswith('_')])
+
+            if result.result != "OK":
+                logger.warning("email_fetch_failed", email_id=email_id, result=str(result))
+                return None
+
+            # aioimaplib FETCH response structure:
+            # result.lines[0]: b'ID FETCH (BODY[] {size}' or similar
+            # result.lines[1]: bytearray or bytes with actual email data
+            # But sometimes the response format is different - let's handle both
+
+            # Check if we have data
+            if len(result.lines) >= 2:
+                raw_email = result.lines[1]
+
+                # Convert bytearray to bytes if needed
+                if isinstance(raw_email, bytearray):
+                    raw_email = bytes(raw_email)
+
+                return (email_id, raw_email)
+
+            logger.warning("unexpected_fetch_response", email_id=email_id)
+            return None
+
+        except Exception as e:
+            logger.error("fetch_email_by_id_failed", email_id=email_id, error=str(e), exc_info=True)
+            return None
+
+    async def process_email_by_id(self, email_id: str) -> Optional[str]:
+        """Process a specific email by ID and extract verification link.
+
+        Args:
+            email_id: IMAP email sequence number
+
+        Returns:
+            Verification link if found, None otherwise
+        """
+        logger.info("processing_email_by_id", email_id=email_id)
+
+        email_data = await self.fetch_email_by_id(email_id)
+        if not email_data:
+            logger.warning("email_not_found", email_id=email_id)
+            return None
+
+        _, raw_email = email_data
+
+        try:
+            link = self.email_processor.process_email(raw_email)
+
+            if link:
+                logger.info("verification_link_found", email_id=email_id, link=link)
                 await self.move_email_to_folder(email_id)
+                await self.expunge_deleted()
+                return link
+            else:
+                logger.info("no_link_in_email", email_id=email_id)
+                return None
 
-            except Exception as e:
-                logger.error(
-                    "email_processing_failed",
-                    email_id=email_id,
-                    error=str(e),
-                    exc_info=True,
-                )
+        except Exception as e:
+            logger.error("email_processing_failed", email_id=email_id, error=str(e), exc_info=True)
+            return None
 
-        # Clean up deleted emails
-        await self.expunge_deleted()
+    async def monitor_idle_notifications(self) -> AsyncIterator[str]:
+        """Monitor for new email notifications using IMAP IDLE.
 
-        return verification_links
-
-    async def monitor_with_idle(self) -> AsyncIterator[list[str]]:
-        """Monitor emails using IMAP IDLE (most efficient).
+        This method stays in IDLE mode as much as possible, only briefly
+        exiting when a new email arrives. It does NOT process emails,
+        just detects that they arrived and yields the email ID.
 
         Yields:
-            List of verification links when new emails arrive
+            Email ID when new emails are detected
         """
         self._running = True
-        logger.info("starting_idle_monitoring")
+        logger.info("starting_idle_notification_monitoring")
 
         while self._running:
             try:
-                # Wait for new emails
-                new_emails = await self.wait_for_new_emails_idle()
+                # Wait for new emails (IDLE active here - fast detection)
+                email_id = await self.wait_for_new_emails_idle()
 
-                if new_emails:
-                    # Process new emails
-                    links = await self.process_emails()
-                    if links:
-                        yield links
+                if email_id:
+                    # Yield the email ID for processing
+                    yield email_id
 
             except Exception as e:
                 logger.error("idle_monitoring_error", error=str(e), exc_info=True)
-                # Reconnect on error
-                await self.disconnect()
-                await asyncio.sleep(5)
-                await self.connect()
-
-    async def monitor_with_polling(self) -> AsyncIterator[list[str]]:
-        """Monitor emails using polling (fallback if IDLE not supported).
-
-        Yields:
-            List of verification links when found
-        """
-        self._running = True
-        logger.info(
-            "starting_polling_monitoring",
-            interval=self.settings.polling_time_in_seconds,
-        )
-
-        while self._running:
-            try:
-                # Check for new emails
-                links = await self.process_emails()
-
-                if links:
-                    yield links
-
-                # Wait before next poll
-                await asyncio.sleep(self.settings.polling_time_in_seconds)
-
-            except Exception as e:
-                logger.error("polling_monitoring_error", error=str(e), exc_info=True)
                 # Reconnect on error
                 await self.disconnect()
                 await asyncio.sleep(5)

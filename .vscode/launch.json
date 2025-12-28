@@ -1,19 +1,40 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Python: Run Netflix Updater",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "src.main",
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
-            "envFile": "${workspaceFolder}/.env",
-            "justMyCode": true
-        }
-    ]
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run Netflix Updater",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.main",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Run Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tests/test_concurrent_performance.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": false
+    },
+    {
+      "name": "Python: Run Pytest",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/", "-v", "-s"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": false
+    }
+  ]
 }
